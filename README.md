@@ -2,6 +2,10 @@
 
 XDRScreen 是一个 macOS → iPad 的高性能局域网屏幕共享与触控回传工具，采用双端原生 Swift 编写。Mac 主机通过 ScreenCaptureKit 捕获桌面并经 VideoToolbox 进行 HEVC 硬件编码，通过 Bonjour 发现与 TCP 传输；iPad 客户端利用 VideoToolbox 硬件解码，并由 Metal 与 Core Image 渲染呈现。支持将 Mac 现有屏幕直接镜像，或为 iPad 动态创建 2× Retina 专用独立扩展屏，同时支持触控手势、视口缩放与键盘输入注入。
 
+![XDRScreen 使用示意：Mac 主机把桌面串流到 iPad，并可双向拖拽文件](Docs/hero-flat.png)
+
+*示意图（AI 生成），用于说明整体形态；实际界面以运行效果为准。*
+
 ## 功能特性
 
 - **双显示方式**：支持「镜像当前屏幕」与基于 macOS 私有 `CGVirtualDisplay` 的「iPad Retina 专用屏」（2732×2048 像素 / 1366×1024 点 @ 60 Hz SDR 独立扩展桌面）。
