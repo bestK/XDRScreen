@@ -249,4 +249,8 @@ UInt32 大端 id | UInt64 大端 offset | 原始文件字节（最多 64 KiB）
 2. **虚拟屏私有接口**：专用屏依赖 macOS 私有 `CGVirtualDisplay` 运行时接口，未来 macOS 更新可能导致接口行为变化或失效；创建失败时将回退镜像模式。
 3. **功能边界**：仅支持单台 iPad 连接；不包含音频采集与传输通道；不支持剪贴板同步；键盘输入不转发 Command / Control / Option 等修饰组合键。文件传输只支持常规文件（不支持文件夹），每个方向同时一个传输。
 4. **分发方式**：本项目面向个人测试与侧载（如 TrollStore），非 App Store 上架应用；主机采用 ad-hoc 签名，重新构建可能导致 macOS 重新提示授权。
-5. **许可证**：本项目未指定许可证。
+5. **许可证**：本项目以 [GNU General Public License v3.0](LICENSE) 发布。
+
+## 许可证
+
+本项目以 GNU General Public License v3.0 发布，完整文本见 [LICENSE](LICENSE)。
