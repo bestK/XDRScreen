@@ -48,6 +48,7 @@ let package = Package(
             path: "MacHost",
             exclude: [
                 "CaptureEncoder.swift",
+                "FileTransferService.swift",
                 "HostApp.swift",
                 "HostController.swift",
                 "InputController.swift"
@@ -65,6 +66,7 @@ let package = Package(
             path: "MacHost",
             exclude: [
                 "DisplayArrangement.swift",
+                "FileTransferService.swift",
                 "HostApp.swift",
                 "HostController.swift",
                 "InputController.swift"

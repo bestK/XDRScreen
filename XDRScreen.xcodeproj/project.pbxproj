@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		B1C2D3E4F5A60718293A4B5C /* FileTransferProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* FileTransferProtocol.swift */; };
+		B2C2D3E4F5A60718293A4B5C /* FileTransferService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2B2C3D4E5F60718293A4B5C /* FileTransferService.swift */; };
+		D3E4F5A60718293A4B5C6D7E /* FileTransferService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3D4E5F60718293A4B5C6D7F /* FileTransferService.swift */; };
+		C1D2E3F4A5B60718293A4B5C /* FileTransferProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* FileTransferProtocol.swift */; };
 		10A3DC04072D4B519CB98041 /* VideoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4686404A14A47E52A423E158 /* VideoView.swift */; };
 		1D08FD5B8F306D7634F90F62 /* FormatKeyframeGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AA5EEB063148AA0BE9D2B6D /* FormatKeyframeGate.swift */; };
 		3D6D45BAEDB48775A40DCCB4 /* HDRMetalVideoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5F42DD2B9E49436C1A4842A /* HDRMetalVideoView.swift */; };
@@ -30,6 +34,9 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		A1B2C3D4E5F60718293A4B5C /* FileTransferProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTransferProtocol.swift; sourceTree = "<group>"; };
+		A2B2C3D4E5F60718293A4B5C /* FileTransferService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTransferService.swift; sourceTree = "<group>"; };
+		C3D4E5F60718293A4B5C6D7F /* FileTransferService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTransferService.swift; sourceTree = "<group>"; };
 		1C5D8AC6BE55803729210B0E /* DisplaySizeChangeDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplaySizeChangeDetector.swift; sourceTree = "<group>"; };
 		21F58B13A39C623F92BC82B4 /* Wire.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wire.swift; sourceTree = "<group>"; };
 		2AA5EEB063148AA0BE9D2B6D /* FormatKeyframeGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormatKeyframeGate.swift; sourceTree = "<group>"; };
@@ -84,6 +91,7 @@
 			isa = PBXGroup;
 			children = (
 				21F58B13A39C623F92BC82B4 /* Wire.swift */,
+				A1B2C3D4E5F60718293A4B5C /* FileTransferProtocol.swift */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -108,6 +116,7 @@
 				C762957BF982C1519BAFC6DD /* ClientApp.swift */,
 				5B1FA62A89963423EEF9B2CA /* ClientController.swift */,
 				1C5D8AC6BE55803729210B0E /* DisplaySizeChangeDetector.swift */,
+				C3D4E5F60718293A4B5C6D7F /* FileTransferService.swift */,
 				D7CCAE1EC47E55975F6058E6 /* TouchView.swift */,
 				5B503E92E0E4E12591B704D9 /* VideoPipelineView.swift */,
 				4686404A14A47E52A423E158 /* VideoView.swift */,
@@ -120,6 +129,7 @@
 			children = (
 				FF17F413BB65D66C6AB17CE7 /* CaptureEncoder.swift */,
 				B24B6B3DEC63741875C06A40 /* DisplayArrangement.swift */,
+				A2B2C3D4E5F60718293A4B5C /* FileTransferService.swift */,
 				7049E15F496644636A4634F0 /* HostApp.swift */,
 				6C48ED4147146C1A4CA3416E /* HostController.swift */,
 				68C9BD460D8D27DAF49A6575 /* InputController.swift */,
@@ -230,6 +240,8 @@
 			files = (
 				9BE21F779E0125379B0BE933 /* CaptureEncoder.swift in Sources */,
 				ED7411D82CC6E124AC9BF229 /* DisplayArrangement.swift in Sources */,
+				B1C2D3E4F5A60718293A4B5C /* FileTransferProtocol.swift in Sources */,
+				B2C2D3E4F5A60718293A4B5C /* FileTransferService.swift in Sources */,
 				B73CF49E9733D8E6AD518864 /* HostApp.swift in Sources */,
 				F9F535C9DF2DF422A77BA57F /* HostController.swift in Sources */,
 				7F3B5F9BD3709F067AA3BB0A /* InputController.swift in Sources */,
@@ -245,6 +257,7 @@
 				89361B09F5D893E3794C7BAA /* ClientApp.swift in Sources */,
 				630AFA44B7A6CB71C987D356 /* ClientController.swift in Sources */,
 				D076BACE803A5A4AE7A593C5 /* DisplaySizeChangeDetector.swift in Sources */,
+				D3E4F5A60718293A4B5C6D7E /* FileTransferService.swift in Sources */,
 				1D08FD5B8F306D7634F90F62 /* FormatKeyframeGate.swift in Sources */,
 				3D6D45BAEDB48775A40DCCB4 /* HDRMetalVideoView.swift in Sources */,
 				F8CC0A72D7BB7BFAA6FC7F03 /* HostSilenceWatchdog.swift in Sources */,
@@ -253,6 +266,7 @@
 				4975F9B181AFB007963429EC /* VideoPresentationGeometry.swift in Sources */,
 				A7F31C2E5D9B48A0C31E7F02 /* ViewportTransform.swift in Sources */,
 				10A3DC04072D4B519CB98041 /* VideoView.swift in Sources */,
+				C1D2E3F4A5B60718293A4B5C /* FileTransferProtocol.swift in Sources */,
 				B113FB4412F7EE0DBD30F103 /* Wire.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

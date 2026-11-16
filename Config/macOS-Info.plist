@@ -32,6 +32,8 @@
 	<array>
 		<string>_xdrscreen._tcp</string>
 	</array>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>XDRScreen Host saves files sent from your iPad into ~/Downloads/XDRScreen and reads files you choose to send.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>XDRScreen Host advertises a Bonjour service and streams your Mac screen to a paired iPad on the local network.</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>

@@ -108,6 +108,27 @@ public enum MessageKind: UInt8, CaseIterable, Sendable {
     case ping = 5
     case status = 6
     case requestKeyframe = 7
+    /// Client -> host: an explicit target bitrate request. Appended after the
+    /// original seven kinds so their numbering never moves; the JSON payload
+    /// format is unchanged and additive.
+    case clientSettings = 8
+
+    // Bidirectional file transfer. Appended after the original eight kinds so
+    // no existing numbering moves. File offers/accepts/rejects/ends/cancels
+    // are JSON messages; only `fileChunk` carries a binary payload.
+    /// Sender -> receiver: metadata for one file (`FileOfferMessage`).
+    case fileOffer = 9
+    /// Receiver -> sender: the offer was accepted (`FileAcceptMessage`).
+    case fileAccept = 10
+    /// Receiver -> sender: the offer was refused (`FileRejectMessage`).
+    case fileReject = 11
+    /// Sender -> receiver: one 64 KiB binary chunk (`FileChunk`).
+    case fileChunk = 12
+    /// Sender -> receiver: all chunks sent, with the whole-file SHA-256
+    /// (`FileEndMessage`).
+    case fileEnd = 13
+    /// Either direction: the transfer is cancelled (`FileCancelMessage`).
+    case fileCancel = 14
 }
 
 // MARK: - Packet
@@ -671,6 +692,114 @@ public struct StatusMessage: Codable, Equatable, Sendable {
 
     public init(message: String) {
         self.message = message
+    }
+}
+
+/// Client -> host target bitrate request, carried as a `clientSettings`
+/// payload. Encoded with the same `WireJSON` convention as every other JSON
+/// message, so `nil` is simply an absent `bitrateMbps` key (an empty object).
+///
+/// `nil` means "follow the host's quality tier" and therefore clears any
+/// manual target on the host. A non-nil value is the requested target in
+/// Mbps; the host clamps it to `minBitrateMbps ... maxBitrateMbps` before use.
+public struct ClientSettingsMessage: Codable, Equatable, Sendable {
+    public let bitrateMbps: Int?
+
+    public init(bitrateMbps: Int?) {
+        self.bitrateMbps = bitrateMbps
+    }
+
+    /// Lowest manual target the host accepts, in Mbps.
+    public static let minBitrateMbps = 4
+    /// Highest manual target the host accepts, in Mbps.
+    public static let maxBitrateMbps = 200
+
+    /// Clamps one requested value into the supported range. Values below the
+    /// floor become `minBitrateMbps`, values above the ceiling become
+    /// `maxBitrateMbps`.
+    public static func clampMbps(_ value: Int) -> Int {
+        min(maxBitrateMbps, max(minBitrateMbps, value))
+    }
+
+    /// The request after clamping; `nil` (follow the host) passes through.
+    public var clampedBitrateMbps: Int? {
+        bitrateMbps.map(Self.clampMbps)
+    }
+}
+
+// MARK: - File transfer JSON messages
+
+/// Sender -> receiver, carried as a `fileOffer` payload.
+///
+/// `name` is the sender's proposed file name. The receiver must run it through
+/// `FileTransfer.sanitizeFileName` before touching the file system and must
+/// reject the offer when `size` exceeds `FileTransfer.maxFileByteCount`.
+public struct FileOfferMessage: Codable, Equatable, Sendable {
+    public let id: UInt32
+    public let name: String
+    public let size: UInt64
+
+    public init(id: UInt32, name: String, size: UInt64) {
+        self.id = id
+        self.name = name
+        self.size = size
+    }
+}
+
+/// Receiver -> sender, carried as a `fileAccept` payload.
+public struct FileAcceptMessage: Codable, Equatable, Sendable {
+    public let id: UInt32
+
+    public init(id: UInt32) {
+        self.id = id
+    }
+}
+
+/// Receiver -> sender, carried as a `fileReject` payload.
+///
+/// `reason` is one of the fixed short codes in
+/// `FileTransfer.RejectReason.rawValue`: `busy`, `tooLarge`, `invalidName`,
+/// `io`, `cancelled`, `unsupported`. It stays a `String` on the wire so an
+/// unknown future code degrades to text instead of failing to decode.
+public struct FileRejectMessage: Codable, Equatable, Sendable {
+    public let id: UInt32
+    public let reason: String
+
+    public init(id: UInt32, reason: String) {
+        self.id = id
+        self.reason = reason
+    }
+
+    public init(id: UInt32, reason: FileTransfer.RejectReason) {
+        self.init(id: id, reason: reason.rawValue)
+    }
+}
+
+/// Sender -> receiver, carried as a `fileEnd` payload. `sha256` is the
+/// lowercase hex SHA-256 of every byte of the file, in order.
+public struct FileEndMessage: Codable, Equatable, Sendable {
+    public let id: UInt32
+    public let sha256: String
+
+    public init(id: UInt32, sha256: String) {
+        self.id = id
+        self.sha256 = sha256
+    }
+}
+
+/// Either direction, carried as a `fileCancel` payload. `reason` uses the same
+/// fixed codes as `FileRejectMessage`.
+public struct FileCancelMessage: Codable, Equatable, Sendable {
+    public let id: UInt32
+    public let reason: String
+
+    public init(id: UInt32, reason: String) {
+        self.id = id
+        self.reason = reason
+    }
+
+    public init(id: UInt32, reason: FileTransfer.RejectReason) {
+        self.init(id: id, reason: reason.rawValue)
     }
 }
 

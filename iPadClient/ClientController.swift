@@ -208,6 +208,9 @@ struct ClientSnapshot: Equatable {
     var stream: ClientStreamStatus?
     var latencyMs = 0
     var lastStatusMessage: String?
+    /// Explicit target bitrate the user picked on this iPad, in Mbps. `nil`
+    /// means "follow the host"; the control-bar action sheet checks this row.
+    var preferredBitrateMbps: Int?
 }
 
 // MARK: - Controller
@@ -216,6 +219,7 @@ final class ClientController {
 
     private static let autoConnectKey = "dev.xdrscreen.client.autoConnect"
     private static let pairedHostKey = "dev.xdrscreen.client.pairedHostName"
+    private static let preferredBitrateKey = "dev.xdrscreen.client.preferredBitrateMbps"
 
     private struct Capabilities {
         var pixelWidth: Int
@@ -229,6 +233,10 @@ final class ClientController {
     private(set) var snapshot = ClientSnapshot()
     var onSnapshot: ((ClientSnapshot) -> Void)?
 
+    /// File transfer state, published on the main queue. The controller owns
+    /// the service so binding follows the connection lifetime exactly.
+    let fileTransfer = FileTransferService()
+
     // Everything below is confined to `queue`.
     private let queue = DispatchQueue(label: "dev.xdrscreen.client.network", qos: .userInitiated)
 
@@ -238,6 +246,9 @@ final class ClientController {
     private var wantsConnection = false
     private var suspended = false
     private var needsRepair = false
+    /// User's saved target in Mbps; `nil` follows the host. Restored on launch
+    /// and re-sent to the host after every authenticated connection.
+    private var preferredBitrateMbps: Int?
 
     private var phase: ClientSnapshot.Phase = .idle
     private var detail = ""
@@ -249,6 +260,9 @@ final class ClientController {
     private var browserRestartWork: DispatchWorkItem?
     private var connection: NWConnection?
     private var channel: SecureChannel?
+    /// The authenticated-session wrapper the file service writes through.
+    /// Created on `.ready` (after the handshake) and detached on teardown.
+    private var fileChannel: ClientFileSendChannel?
     private var currentHostName: String?
     private var connectionGeneration = 0
     private var everReady = false
@@ -328,6 +342,10 @@ final class ClientController {
     init() {
         let defaults = UserDefaults.standard
         autoConnect = defaults.object(forKey: Self.autoConnectKey) as? Bool ?? true
+        // Re-clamp on read: a stale or hand-edited defaults value must never
+        // be sent outside the range the host accepts.
+        preferredBitrateMbps = (defaults.object(forKey: Self.preferredBitrateKey) as? Int)
+            .map(ClientSettingsMessage.clampMbps)
         if var stored = PairingStore.load() {
             // The last host the user picked wins over the host that happened to
             // be selected when the key was saved. The key itself stays in the
@@ -549,6 +567,29 @@ final class ClientController {
         }
     }
 
+    /// Saves the target bitrate chosen in the control bar (`nil` = follow the
+    /// host) and pushes it to the host immediately when the channel is
+    /// authenticated. While disconnected the value is only stored; the next
+    /// connection sends it right after its hello.
+    func setPreferredBitrateMbps(_ mbps: Int?) {
+        let normalized = mbps.map(ClientSettingsMessage.clampMbps)
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.preferredBitrateMbps = normalized
+            if let normalized {
+                UserDefaults.standard.set(normalized, forKey: Self.preferredBitrateKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.preferredBitrateKey)
+            }
+            if self.everReady, self.channel != nil {
+                // `force` matters for the nil case: choosing "跟随主机" must
+                // clear a target that was sent earlier in this connection.
+                self.sendClientSettingsLocked(force: true)
+            }
+            self.publishLocked()
+        }
+    }
+
     func sendInput(_ message: InputMessage) {
         guard let data = try? WireJSON.encode(message) else { return }
         queue.async { [weak self] in
@@ -620,6 +661,9 @@ final class ClientController {
             guard let self, !self.suspended else { return }
             self.suspended = true
             self.formatGate.appDidSuspend()
+            // Cancel first so the rows keep the background reason; the unbind
+            // that follows then finds nothing active to overwrite it with.
+            self.fileTransfer.cancelAllForBackground()
             self.cancelConnectionLocked()
             self.stopBrowserLocked()
             self.phase = .paused
@@ -627,6 +671,12 @@ final class ClientController {
             self.streamStatus = nil
             self.publishLocked()
         }
+    }
+
+    /// Called from `applicationWillTerminate`. Deletes unfinished temp files
+    /// synchronously, before the process can exit.
+    func handleWillTerminate() {
+        fileTransfer.shutdownForTermination()
     }
 
     func handleWillEnterForeground() {
@@ -826,6 +876,13 @@ final class ClientController {
 
     private func cancelConnectionLocked() {
         connectionGeneration += 1
+        // Detach file transfer before the socket goes away. The service queue
+        // cancels active transfers and deletes unfinished temp files.
+        if let fileChannel {
+            fileChannel.detach()
+            fileTransfer.unbind(from: fileChannel)
+            self.fileChannel = nil
+        }
         // Any apply callback still queued on the main queue belongs to the
         // session that is ending; it must not request an IDR for the next one.
         formatGate.connectionDidEnd()
@@ -932,11 +989,15 @@ final class ClientController {
             connectTimeoutWork?.cancel()
             connectTimeoutWork = nil
             sendHelloLocked(generation: generation)
+            // Sent after the hello on the same ordered channel, so the host
+            // has already authenticated this session when it arrives.
+            sendClientSettingsLocked()
             phase = .handshaking(currentHostName ?? "Mac")
             detail = "加密通道已建立，正在请求画面…"
             publishLocked()
             startPingLocked(generation: generation)
             scheduleHandshakeTimeout(generation: generation)
+            bindFileTransferLocked()
         case .waiting(let error):
             if !everReady {
                 detail = Self.describe(error)
@@ -1005,6 +1066,31 @@ final class ClientController {
                 error: nil
             )
         }
+    }
+
+    /// Sends the client's target bitrate request. `force` is used for a user
+    /// action; without it an unset preference stays silent, so reconnecting
+    /// never clears a manual target the user set on the Mac itself.
+    private func sendClientSettingsLocked(force: Bool = false) {
+        guard force || preferredBitrateMbps != nil else { return }
+        guard let channel, everReady else { return }
+        let message = ClientSettingsMessage(bitrateMbps: preferredBitrateMbps)
+        guard let data = try? WireJSON.encode(message) else { return }
+        channel.send(.clientSettings, payload: data, completion: nil)
+    }
+
+    /// Called only from `.ready`, which `SecureChannel` reports after the
+    /// authenticated handshake. Binding any earlier would let a queued file
+    /// packet leave before the session is proven.
+    private func bindFileTransferLocked() {
+        guard everReady, let channel else { return }
+        if let fileChannel {
+            fileChannel.detach()
+            fileTransfer.unbind(from: fileChannel)
+        }
+        let wrapper = ClientFileSendChannel(channel: channel)
+        fileChannel = wrapper
+        fileTransfer.bind(to: wrapper)
     }
 
     private func scheduleHandshakeTimeout(generation: Int) {
@@ -1127,8 +1213,17 @@ final class ClientController {
         case .ping:
             handlePingEchoLocked(packet.payload)
 
-        case .input, .requestKeyframe:
+        case .input, .requestKeyframe, .clientSettings:
+            // Client-to-host kinds; ignore anything echoed back.
             break
+
+        case .fileOffer, .fileAccept, .fileReject, .fileChunk, .fileEnd, .fileCancel:
+            // File-transfer kinds are only meaningful inside an authenticated
+            // session. `everReady` is false before the handshake and is
+            // cleared by `cancelConnectionLocked`, so a message arriving on a
+            // candidate or half-torn-down connection is dropped here.
+            guard everReady, fileChannel != nil else { break }
+            fileTransfer.handle(packet)
         }
     }
 
@@ -1321,6 +1416,7 @@ final class ClientController {
         snapshot.stream = streamStatus
         snapshot.latencyMs = latencyMs
         snapshot.lastStatusMessage = lastStatusMessage
+        snapshot.preferredBitrateMbps = preferredBitrateMbps
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -1428,5 +1524,47 @@ final class ClientController {
         default:
             return error.localizedDescription
         }
+    }
+}
+
+// MARK: - File transfer session channel
+
+/// The controlled send path for one authenticated session.
+///
+/// The file service runs on its own queue and may keep completing writes while
+/// the network controller tears the session down. `detach()` is called on the
+/// network queue first, so no later file packet can reach a closed or replaced
+/// `SecureChannel`; the lock makes that handshake safe across the two queues.
+final class ClientFileSendChannel: FileTransferSendChannel {
+    private let lock = NSLock()
+    private var channel: SecureChannel?
+
+    init(channel: SecureChannel) {
+        self.channel = channel
+    }
+
+    var isFileTransferReady: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return channel != nil
+    }
+
+    func sendFilePacket(_ kind: MessageKind, payload: Data, completion: ((Error?) -> Void)?) {
+        lock.lock()
+        let current = channel
+        lock.unlock()
+        guard let current else {
+            completion?(WireError.channelClosed)
+            return
+        }
+        // `SecureChannel.send` serialises on its own queue, so chunk order is
+        // preserved even though the file service calls from another queue.
+        current.send(kind, payload: payload, completion: completion)
+    }
+
+    func detach() {
+        lock.lock()
+        channel = nil
+        lock.unlock()
     }
 }

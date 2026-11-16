@@ -177,6 +177,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     statusSection
                     displaySection
+                    FileTransferSectionView(transfer: controller.fileTransfer)
                     pairingSection
                     permissionsSection
                     launchSection
@@ -281,6 +282,21 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
+                Divider()
+
+                Picker("目标码率", selection: manualBitrateBinding) {
+                    Text("跟随画质档位").tag(nil as Int?)
+                    ForEach(manualBitrateChoices, id: \.self) { mbps in
+                        Text("\(mbps) Mbps").tag(Optional(mbps))
+                    }
+                }
+                .pickerStyle(.radioGroup)
+
+                Text(manualBitrateCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 InfoRow(label: "专用屏",
                         value: controller.virtualDisplaySummary ?? "未创建（连接 iPad 后按需创建）")
 
@@ -329,6 +345,32 @@ struct ContentView: View {
             get: { controller.quality },
             set: { controller.setQuality($0) }
         )
+    }
+
+    /// Presets offered in the window. A value pushed by the iPad client that
+    /// is not one of them (the protocol allows 4–200 Mbps) is appended so the
+    /// picker still shows a truthful selection instead of an empty row.
+    private var manualBitrateChoices: [Int] {
+        var choices = [10, 20, 30, 50, 80, 120]
+        if let current = controller.manualBitrateMbps, !choices.contains(current) {
+            choices.append(current)
+            choices.sort()
+        }
+        return choices
+    }
+
+    private var manualBitrateBinding: Binding<Int?> {
+        Binding(
+            get: { controller.manualBitrateMbps },
+            set: { controller.setManualBitrate($0) }
+        )
+    }
+
+    private var manualBitrateCaption: String {
+        if let mbps = controller.manualBitrateMbps {
+            return "当前目标码率 \(mbps) Mbps（手动值优先于画质档位；发送积压时仍会自动下调）。iPad 客户端也能设置，最后修改的一端生效。"
+        }
+        return "当前跟随「\(controller.quality.title)」档位的码率预算。iPad 客户端也能设置，最后修改的一端生效。"
     }
 
     // MARK: Pairing
@@ -560,6 +602,276 @@ struct ContentView: View {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(lines.joined(separator: "\n"), forType: .string)
+    }
+}
+
+// MARK: - File transfer
+
+private struct FileTransferSectionView: View {
+    @ObservedObject var transfer: FileTransferService
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                dropZone
+
+                HStack(spacing: 8) {
+                    Button("发送文件…") { transfer.chooseFilesToSend() }
+                        .controlSize(.small)
+                        .disabled(!transfer.isConnected)
+                    Text(transfer.isConnected ? "iPad 已连接，可以发送" : "连接 iPad 后可发送文件")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+
+                destinationRow
+
+                Divider()
+
+                transferList
+
+                if let error = transfer.lastError {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+
+                Text("每个方向同一时刻只传输一个文件；单文件上限 4 GiB。iPad 发来的文件保存到上面的目录，同名时自动追加编号。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(6)
+        } label: {
+            Text("文件传输").font(.subheadline.weight(.semibold))
+        }
+    }
+
+    private var dropZone: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(
+                    style: StrokeStyle(lineWidth: 1, dash: [6, 4])
+                )
+                .foregroundStyle(
+                    transfer.isConnected
+                        ? Color.secondary.opacity(0.55)
+                        : Color.secondary.opacity(0.25)
+                )
+            VStack(spacing: 4) {
+                Image(systemName: "arrow.down.doc")
+                    .font(.system(size: 18, weight: .regular))
+                Text("把文件拖到这里发送到 iPad")
+                    .font(.callout)
+                Text("只接受文件，可一次拖入多个")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .foregroundStyle(.secondary)
+
+            FileDropZone(isEnabled: transfer.isConnected) { urls in
+                transfer.sendFiles(at: urls)
+            }
+        }
+        .frame(height: 84)
+        .help("拖入常规文件即可发送；文件夹和符号链接会被拒绝。")
+    }
+
+    private var destinationRow: some View {
+        HStack(spacing: 8) {
+            Text("保存到")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 40, alignment: .leading)
+            Text(transfer.destinationPath)
+                .font(.system(size: 11, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+                .help(transfer.destinationPath)
+            Spacer(minLength: 4)
+            Button("选择…") { transfer.chooseDestination() }
+                .controlSize(.small)
+            Button("恢复默认") { transfer.restoreDefaultDestination() }
+                .controlSize(.small)
+        }
+    }
+
+    private var transferList: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if transfer.items.isEmpty {
+                Text("暂无传输记录")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(transfer.items.reversed()) { item in
+                            row(for: item)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 180)
+            }
+        }
+    }
+
+    private func row(for item: FileTransferItem) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: item.direction.symbolName)
+                .font(.system(size: 14))
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(item.name)
+                        .font(.callout)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(item.direction.title)
+                        .font(.caption2)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Color(nsColor: .controlBackgroundColor)))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+
+                ProgressView(value: item.progress)
+                    .progressViewStyle(.linear)
+
+                HStack(spacing: 6) {
+                    Text(item.statusText)
+                        .font(.caption2)
+                        .foregroundStyle(statusColor(item.status))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(sizeText(item))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    if item.status.isActive {
+                        Button("取消") { transfer.cancelTransfer(id: item.id) }
+                            .controlSize(.mini)
+                    }
+                    if item.status == .completed,
+                       item.direction == .receive,
+                       item.localURL != nil {
+                        Button("在 Finder 中显示") { transfer.revealInFinder(id: item.id) }
+                            .controlSize(.mini)
+                    }
+                }
+            }
+        }
+    }
+
+    private func statusColor(_ status: FileTransferStatus) -> Color {
+        switch status {
+        case .waiting, .transferring: return .secondary
+        case .completed: return .green
+        case .failed: return .orange
+        case .cancelled: return .secondary
+        }
+    }
+
+    private func sizeText(_ item: FileTransferItem) -> String {
+        // Refused inputs never got a size; do not claim "0 bytes / 0 bytes".
+        if item.totalBytes == 0, item.status != .completed {
+            return ""
+        }
+        let done = ByteCountFormatter.string(fromByteCount: Int64(clamping: item.transferredBytes),
+                                             countStyle: .file)
+        let total = ByteCountFormatter.string(fromByteCount: Int64(clamping: item.totalBytes),
+                                              countStyle: .file)
+        return "\(done) / \(total)"
+    }
+}
+
+/// Drop target for `.fileURL` drags. SwiftUI has no first-class multi-file
+/// drop area on macOS 15 that also gives us an explicit "only files" filter,
+/// so this is a small NSView representable.
+private struct FileDropZone: NSViewRepresentable {
+    var isEnabled: Bool
+    var onDrop: ([URL]) -> Void
+
+    func makeNSView(context: Context) -> FileDropNSView {
+        let view = FileDropNSView()
+        view.onDrop = onDrop
+        view.isEnabled = isEnabled
+        return view
+    }
+
+    func updateNSView(_ nsView: FileDropNSView, context: Context) {
+        nsView.onDrop = onDrop
+        nsView.isEnabled = isEnabled
+    }
+}
+
+private final class FileDropNSView: NSView {
+    var onDrop: (([URL]) -> Void)?
+    var isEnabled = true
+    private var isHighlighted = false {
+        didSet { needsDisplay = true }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not used")
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard isEnabled, !fileURLs(from: sender).isEmpty else { return [] }
+        isHighlighted = true
+        return .copy
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        isHighlighted = false
+    }
+
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        isHighlighted = false
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        isEnabled && !fileURLs(from: sender).isEmpty
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        isHighlighted = false
+        let urls = fileURLs(from: sender)
+        guard isEnabled, !urls.isEmpty else { return false }
+        onDrop?(urls)
+        return true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard isHighlighted else { return }
+        NSColor.controlAccentColor.withAlphaComponent(0.14).setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1),
+                     xRadius: 8,
+                     yRadius: 8).fill()
+    }
+
+    private func fileURLs(from info: NSDraggingInfo) -> [URL] {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [
+            .urlReadingFileURLsOnly: true
+        ]
+        let objects = info.draggingPasteboard.readObjects(forClasses: [NSURL.self],
+                                                          options: options)
+        return (objects as? [NSURL])?.map { $0 as URL } ?? []
     }
 }
 

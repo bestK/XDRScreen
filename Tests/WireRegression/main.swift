@@ -269,7 +269,11 @@ func testInvalidFrames(_ report: Report) {
         expectThrows(report, "unknown message kind byte is rejected", .invalidMessageKind(0x7F)) {
             _ = try WireCrypto.openBody(combined, key: key)
         }
-        report.check(MessageKind(rawValue: 0x07) == .requestKeyframe && MessageKind(rawValue: 0x08) == nil,
+        report.check(MessageKind(rawValue: 0x07) == .requestKeyframe
+                     && MessageKind(rawValue: 0x08) == .clientSettings
+                     && MessageKind(rawValue: 0x09) == .fileOffer
+                     && MessageKind(rawValue: 0x0E) == .fileCancel
+                     && MessageKind(rawValue: 0x0F) == nil,
                      "message kind numbering is fixed")
     } catch {
         report.check(false, "unknown kind fixture", "\(error)")
@@ -1436,6 +1440,8 @@ print("XDRScreen wire protocol regression")
 print("macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
 
 testMessages(report)
+testClientSettings(report)
+testFileTransfer(report)
 testCrypto(report)
 testTampering(report)
 testInvalidFrames(report)

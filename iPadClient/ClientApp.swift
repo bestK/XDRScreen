@@ -9,8 +9,10 @@
 //
 
 import AVFoundation
+import Combine
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 // MARK: - App
 
@@ -83,6 +85,8 @@ final class ClientViewController: UIViewController {
     private let barDot = UIView()
     private let barLabel = UILabel()
     private let fitButton = UIButton(type: .system)
+    private let bitrateButton = UIButton(type: .system)
+    private let fileButton = UIButton(type: .system)
     private let keyboardButton = UIButton(type: .system)
     private let reconnectButton = UIButton(type: .system)
     private let disconnectButton = UIButton(type: .system)
@@ -92,11 +96,16 @@ final class ClientViewController: UIViewController {
     private let toastLabel = UILabel()
 
     private var latest = ClientSnapshot()
+    private var fileCancellables = Set<AnyCancellable>()
     private var barExpanded = false
     private var statsTimer: Timer?
     private var autoCollapseWork: DispatchWorkItem?
     private var toastHideWork: DispatchWorkItem?
     private var lastShownStatusMessage: String?
+
+    /// The controller owns the service so binding follows the session exactly;
+    /// the UI only observes it.
+    private var fileTransfer: FileTransferService { controller.fileTransfer }
 
     private var pixelScale: CGFloat {
         view.window?.screen.nativeScale ?? traitCollection.displayScale
@@ -187,6 +196,25 @@ final class ClientViewController: UIViewController {
             self?.apply(snapshot)
         }
 
+        // A drop only adds a file to the send queue; it does not touch the
+        // touch surface, so single-finger mouse input and pinch zoom behave
+        // exactly as before while the picture is on screen.
+        viewportContainer.addInteraction(UIDropInteraction(delegate: self))
+
+        fileTransfer.$lastError
+            .compactMap { $0 }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] message in
+                self?.showToast(message)
+            }
+            .store(in: &fileCancellables)
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillTerminate),
+            name: UIApplication.willTerminateNotification,
+            object: nil
+        )
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(appDidEnterBackground),
@@ -242,6 +270,11 @@ final class ClientViewController: UIViewController {
 
     @objc private func appWillEnterForeground() {
         controller.handleWillEnterForeground()
+    }
+
+    @objc private func appWillTerminate() {
+        // Removes any unfinished `.part` file before the process exits.
+        controller.handleWillTerminate()
     }
 
     // MARK: - Viewport zoom
@@ -418,13 +451,18 @@ final class ClientViewController: UIViewController {
         barLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         configureFitButton()
+        configureChromeButton(bitrateButton, systemName: "speedometer", action: #selector(bitrateTapped))
+        bitrateButton.accessibilityLabel = "码率"
+        configureChromeButton(fileButton, systemName: "arrow.up.arrow.down", action: #selector(filesTapped))
+        fileButton.accessibilityLabel = "文件"
         configureChromeButton(keyboardButton, systemName: "keyboard", action: #selector(toggleKeyboard))
         configureChromeButton(reconnectButton, systemName: "arrow.clockwise", action: #selector(reconnectTapped))
         configureChromeButton(disconnectButton, systemName: "xmark.circle", action: #selector(disconnectTapped))
         configureChromeButton(collapseButton, systemName: "chevron.up", action: #selector(collapseTapped))
 
         let stack = UIStackView(arrangedSubviews: [
-            barDot, barLabel, fitButton, keyboardButton, reconnectButton, disconnectButton, collapseButton
+            barDot, barLabel, fitButton, bitrateButton, fileButton,
+            keyboardButton, reconnectButton, disconnectButton, collapseButton
         ])
         stack.axis = .horizontal
         stack.alignment = .center
@@ -998,6 +1036,47 @@ final class ClientViewController: UIViewController {
         setBarExpanded(false)
     }
 
+    /// Target-bitrate presets. The protocol accepts 4–200 Mbps; the sheet
+    /// offers the same practical steps as the Mac window.
+    private static let bitrateChoices = [10, 20, 30, 50, 80, 120]
+
+    @objc private func bitrateTapped() {
+        let current = latest.preferredBitrateMbps
+        let alert = UIAlertController(
+            title: "目标码率",
+            message: "选择后立即同步到 Mac；「跟随主机」使用 Mac 的画质档位。弱网时仍会自动降码率。",
+            preferredStyle: .actionSheet
+        )
+        alert.addAction(UIAlertAction(
+            title: current == nil ? "✓ 跟随主机" : "跟随主机",
+            style: .default
+        ) { [weak self] _ in
+            self?.controller.setPreferredBitrateMbps(nil)
+        })
+        for mbps in Self.bitrateChoices {
+            alert.addAction(UIAlertAction(
+                title: current == mbps ? "✓ \(mbps) Mbps" : "\(mbps) Mbps",
+                style: .default
+            ) { [weak self] _ in
+                self?.controller.setPreferredBitrateMbps(mbps)
+            })
+        }
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+        presentSheet(alert, anchor: bitrateButton)
+    }
+
+    @objc private func filesTapped() {
+        let sheet = FileTransferViewController(service: fileTransfer)
+        let navigation = UINavigationController(rootViewController: sheet)
+        navigation.modalPresentationStyle = .pageSheet
+        navigation.overrideUserInterfaceStyle = .dark
+        if let presentation = navigation.sheetPresentationController {
+            presentation.detents = [.medium(), .large()]
+            presentation.prefersGrabberVisible = true
+        }
+        presentSafely(navigation)
+    }
+
     @objc private func toggleKeyboard() {
         if touchView.isFirstResponder {
             _ = touchView.resignFirstResponder()
@@ -1090,6 +1169,543 @@ final class ClientViewController: UIViewController {
         }
         toastHideWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.5, execute: work)
+    }
+}
+
+// MARK: - Drop to send
+
+extension ClientViewController: UIDropInteractionDelegate {
+
+    func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
+        session.hasItemsConforming(toTypeIdentifiers: [UTType.fileURL.identifier])
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction,
+                         sessionDidUpdate session: UIDropSession) -> UIDropProposal {
+        UIDropProposal(operation: canHandleDrop(session) ? .copy : .forbidden)
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
+        let providers = session.items.map(\.itemProvider)
+        guard !providers.isEmpty else { return }
+
+        // Resolve every provider before queueing so files keep the order the
+        // user dropped them in.
+        var loaded = [URL?](repeating: nil, count: providers.count)
+        let group = DispatchGroup()
+        let lock = NSLock()
+        for (index, provider) in providers.enumerated() {
+            guard provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) else { continue }
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                defer { group.leave() }
+                let url: URL?
+                if let value = item as? URL {
+                    url = value
+                } else if let data = item as? Data {
+                    url = URL(dataRepresentation: data, relativeTo: nil)
+                } else {
+                    url = nil
+                }
+                guard let url else { return }
+                lock.lock()
+                loaded[index] = url
+                lock.unlock()
+            }
+        }
+
+        group.notify(queue: .main) { [weak self] in
+            guard let self else { return }
+            let urls = loaded.compactMap { $0 }
+            guard !urls.isEmpty else {
+                self.showToast("拖入的内容不是文件。")
+                return
+            }
+            // The service checks the authenticated session itself and reports
+            // "尚未连接 Mac" through `lastError`, which the root view toasts.
+            self.fileTransfer.sendFiles(at: urls)
+            self.showToast(urls.count == 1
+                           ? "正在发送 \(urls[0].lastPathComponent)…"
+                           : "正在发送 \(urls.count) 个文件…")
+        }
+    }
+
+    private func canHandleDrop(_ session: UIDropSession) -> Bool {
+        session.hasItemsConforming(toTypeIdentifiers: [UTType.fileURL.identifier])
+    }
+}
+
+// MARK: - File transfer sheet
+
+private final class FileTransferViewController: UIViewController,
+                                               UITableViewDataSource,
+                                               UITableViewDelegate,
+                                               UIDocumentPickerDelegate {
+
+    private let service: FileTransferService
+    private var items: [FileTransferItem] = []
+    private var cancellables = Set<AnyCancellable>()
+    private var pickingDestination = false
+
+    private let sendButton = UIButton(type: .system)
+    private let destinationValueLabel = UILabel()
+    private let chooseFolderButton = UIButton(type: .system)
+    private let restoreButton = UIButton(type: .system)
+    private let connectionLabel = UILabel()
+    private let statusLabel = UILabel()
+    private let tableView = UITableView(frame: .zero, style: .plain)
+    private let emptyLabel = UILabel()
+
+    init(service: FileTransferService) {
+        self.service = service
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        overrideUserInterfaceStyle = .dark
+        view.backgroundColor = Palette.panel
+        title = "文件传输"
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            title: "完成",
+            style: .done,
+            target: self,
+            action: #selector(doneTapped)
+        )
+
+        buildHeader()
+        buildTable()
+        bindService()
+        apply(items: service.items)
+        destinationChanged(path: service.destinationPath, custom: service.usesCustomDestination)
+        connectionChanged(service.isConnected)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        tableView.contentInset.bottom = view.safeAreaInsets.bottom
+    }
+
+    @objc private func doneTapped() {
+        dismiss(animated: true)
+    }
+
+    // MARK: Layout
+
+    private func buildHeader() {
+        var sendConfig = UIButton.Configuration.filled()
+        sendConfig.title = "发送文件…"
+        sendConfig.image = UIImage(systemName: "tray.and.arrow.up")
+        sendConfig.imagePadding = 8
+        sendConfig.baseForegroundColor = .black
+        sendConfig.baseBackgroundColor = Palette.primary
+        sendConfig.cornerStyle = .medium
+        sendConfig.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+            var out = incoming
+            out.font = .systemFont(ofSize: 15, weight: .semibold)
+            return out
+        }
+        sendButton.configuration = sendConfig
+        sendButton.addAction(UIAction { [weak self] _ in
+            self?.presentSendPicker()
+        }, for: .touchUpInside)
+        sendButton.translatesAutoresizingMaskIntoConstraints = false
+        sendButton.heightAnchor.constraint(equalToConstant: 44).isActive = true
+
+        let destinationTitle = UILabel()
+        destinationTitle.text = "接收目录"
+        destinationTitle.font = .systemFont(ofSize: 11, weight: .medium)
+        destinationTitle.textColor = Palette.tertiary
+
+        destinationValueLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        destinationValueLabel.textColor = Palette.secondary
+        destinationValueLabel.numberOfLines = 2
+        destinationValueLabel.lineBreakMode = .byTruncatingMiddle
+
+        configureSecondaryButton(chooseFolderButton, title: "选择文件夹…") { [weak self] in
+            self?.presentDestinationPicker()
+        }
+        configureSecondaryButton(restoreButton, title: "恢复默认") { [weak self] in
+            self?.service.restoreDefaultDestination()
+        }
+
+        let buttons = UIStackView(arrangedSubviews: [chooseFolderButton, restoreButton, UIView()])
+        buttons.axis = .horizontal
+        buttons.spacing = 8
+
+        let destinationStack = UIStackView(arrangedSubviews: [
+            destinationTitle, destinationValueLabel, buttons
+        ])
+        destinationStack.axis = .vertical
+        destinationStack.spacing = 6
+        destinationStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let destinationBox = UIView()
+        destinationBox.translatesAutoresizingMaskIntoConstraints = false
+        destinationBox.backgroundColor = UIColor(white: 1, alpha: 0.05)
+        destinationBox.layer.cornerRadius = 10
+        destinationBox.layer.cornerCurve = .continuous
+        destinationBox.layer.borderWidth = 1 / UIScreen.main.scale
+        destinationBox.layer.borderColor = Palette.stroke.cgColor
+        destinationBox.addSubview(destinationStack)
+        NSLayoutConstraint.activate([
+            destinationStack.leadingAnchor.constraint(equalTo: destinationBox.leadingAnchor, constant: 12),
+            destinationStack.trailingAnchor.constraint(equalTo: destinationBox.trailingAnchor, constant: -12),
+            destinationStack.topAnchor.constraint(equalTo: destinationBox.topAnchor, constant: 10),
+            destinationStack.bottomAnchor.constraint(equalTo: destinationBox.bottomAnchor, constant: -10)
+        ])
+
+        connectionLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        connectionLabel.textColor = Palette.tertiary
+        connectionLabel.numberOfLines = 0
+
+        statusLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        statusLabel.textColor = Palette.warning
+        statusLabel.numberOfLines = 2
+        statusLabel.isHidden = true
+
+        let header = UIStackView(arrangedSubviews: [
+            sendButton, destinationBox, connectionLabel, statusLabel
+        ])
+        header.axis = .vertical
+        header.spacing = 10
+        header.setCustomSpacing(6, after: destinationBox)
+        header.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(header)
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            header.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            header.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16)
+        ])
+        self.headerBottom = header.bottomAnchor
+    }
+
+    private var headerBottom: NSLayoutYAxisAnchor!
+
+    private func configureSecondaryButton(_ button: UIButton,
+                                          title: String,
+                                          action: @escaping () -> Void) {
+        var config = UIButton.Configuration.gray()
+        config.title = title
+        config.baseForegroundColor = Palette.primary
+        config.cornerStyle = .medium
+        config.contentInsets = NSDirectionalEdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10)
+        config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+            var out = incoming
+            out.font = .systemFont(ofSize: 12, weight: .medium)
+            return out
+        }
+        button.configuration = config
+        button.addAction(UIAction { _ in action() }, for: .touchUpInside)
+    }
+
+    private func buildTable() {
+        tableView.translatesAutoresizingMaskIntoConstraints = false
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.backgroundColor = .clear
+        tableView.separatorColor = UIColor(white: 1, alpha: 0.08)
+        tableView.separatorInset = UIEdgeInsets(top: 0, left: 16, bottom: 0, right: 16)
+        tableView.rowHeight = UITableView.automaticDimension
+        tableView.estimatedRowHeight = 88
+        tableView.register(FileTransferCell.self, forCellReuseIdentifier: FileTransferCell.reuseIdentifier)
+        view.addSubview(tableView)
+
+        emptyLabel.text = "暂无传输。点按「发送文件…」或把文件拖入画面。"
+        emptyLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        emptyLabel.textColor = Palette.tertiary
+        emptyLabel.textAlignment = .center
+        emptyLabel.numberOfLines = 0
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(emptyLabel)
+
+        NSLayoutConstraint.activate([
+            tableView.topAnchor.constraint(equalTo: headerBottom, constant: 10),
+            tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            emptyLabel.centerXAnchor.constraint(equalTo: tableView.centerXAnchor),
+            emptyLabel.topAnchor.constraint(equalTo: tableView.topAnchor, constant: 48),
+            emptyLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
+            emptyLabel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24)
+        ])
+    }
+
+    // MARK: Service observation
+
+    private func bindService() {
+        service.$items
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] items in self?.apply(items: items) }
+            .store(in: &cancellables)
+
+        service.$destinationPath
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] path in
+                guard let self else { return }
+                self.destinationChanged(path: path, custom: self.service.usesCustomDestination)
+            }
+            .store(in: &cancellables)
+
+        service.$usesCustomDestination
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] custom in
+                guard let self else { return }
+                self.destinationChanged(path: self.service.destinationPath, custom: custom)
+            }
+            .store(in: &cancellables)
+
+        service.$isConnected
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] connected in self?.connectionChanged(connected) }
+            .store(in: &cancellables)
+
+        service.$lastError
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] message in
+                guard let self else { return }
+                self.statusLabel.text = message
+                self.statusLabel.isHidden = message == nil
+            }
+            .store(in: &cancellables)
+    }
+
+    private func apply(items newItems: [FileTransferItem]) {
+        let oldIDs = items.map(\.id)
+        items = newItems
+        emptyLabel.isHidden = !items.isEmpty
+
+        if oldIDs != items.map(\.id) {
+            tableView.reloadData()
+            return
+        }
+        // Same rows, new bytes: update in place so an active drag-out and the
+        // cancel buttons keep working while progress changes.
+        for cell in tableView.visibleCells {
+            guard let cell = cell as? FileTransferCell,
+                  let indexPath = tableView.indexPath(for: cell),
+                  indexPath.row < items.count else { continue }
+            configure(cell, at: indexPath)
+        }
+    }
+
+    private func destinationChanged(path: String, custom: Bool) {
+        destinationValueLabel.text = path
+        restoreButton.isHidden = !custom
+    }
+
+    private func connectionChanged(_ connected: Bool) {
+        connectionLabel.text = connected
+            ? "已连接 Mac，可收发文件。"
+            : "尚未连接 Mac。发送前请先连接；接收由 Mac 发起。"
+        sendButton.isEnabled = connected
+        sendButton.alpha = connected ? 1 : 0.5
+    }
+
+    // MARK: Pickers
+
+    private func presentSendPicker() {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: false)
+        picker.allowsMultipleSelection = true
+        picker.delegate = self
+        pickingDestination = false
+        present(picker, animated: true)
+    }
+
+    private func presentDestinationPicker() {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
+        picker.allowsMultipleSelection = false
+        picker.delegate = self
+        pickingDestination = true
+        present(picker, animated: true)
+    }
+
+    func documentPicker(_ controller: UIDocumentPickerViewController,
+                        didPickDocumentsAt urls: [URL]) {
+        let destination = pickingDestination
+        pickingDestination = false
+        if destination {
+            guard let url = urls.first else { return }
+            service.setDestination(url)
+        } else {
+            service.sendFiles(at: urls)
+        }
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        pickingDestination = false
+    }
+
+    // MARK: Table
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        items.count
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(
+            withIdentifier: FileTransferCell.reuseIdentifier,
+            for: indexPath
+        ) as! FileTransferCell
+        configure(cell, at: indexPath)
+        return cell
+    }
+
+    private func configure(_ cell: FileTransferCell, at indexPath: IndexPath) {
+        let item = items[indexPath.row]
+        cell.configure(with: item)
+        cell.onCancel = { [weak self] in
+            self?.service.cancelTransfer(id: item.id)
+        }
+        cell.onShare = { [weak self, weak cell] in
+            guard let self, let url = item.localURL, let cell else { return }
+            self.presentShare(url: url, from: cell.shareButton)
+        }
+    }
+
+    private func presentShare(url: URL, from anchor: UIView) {
+        let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        if let popover = activity.popoverPresentationController {
+            popover.sourceView = anchor
+            popover.sourceRect = anchor.bounds
+            popover.permittedArrowDirections = .any
+        }
+        present(activity, animated: true)
+    }
+}
+
+// MARK: - Transfer row
+
+private final class FileTransferCell: UITableViewCell, UIDragInteractionDelegate {
+
+    static let reuseIdentifier = "FileTransferCell"
+
+    let shareButton = UIButton(type: .system)
+    private let nameLabel = UILabel()
+    private let detailLabel = UILabel()
+    private let progressView = UIProgressView(progressViewStyle: .bar)
+    private let cancelButton = UIButton(type: .system)
+    private var dragURL: URL?
+
+    var onCancel: (() -> Void)?
+    var onShare: (() -> Void)?
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .none
+        backgroundColor = .clear
+        contentView.backgroundColor = .clear
+
+        nameLabel.font = .systemFont(ofSize: 14, weight: .medium)
+        nameLabel.textColor = Palette.primary
+        nameLabel.numberOfLines = 2
+        nameLabel.lineBreakMode = .byTruncatingMiddle
+
+        detailLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        detailLabel.textColor = Palette.secondary
+        detailLabel.numberOfLines = 2
+
+        progressView.trackTintColor = UIColor(white: 1, alpha: 0.1)
+        progressView.progressTintColor = Palette.positive
+        progressView.layer.cornerRadius = 1.5
+        progressView.clipsToBounds = true
+        progressView.translatesAutoresizingMaskIntoConstraints = false
+        progressView.heightAnchor.constraint(equalToConstant: 3).isActive = true
+
+        configureIconButton(shareButton, systemName: "square.and.arrow.up")
+        shareButton.accessibilityLabel = "分享"
+        shareButton.addTarget(self, action: #selector(shareTapped), for: .touchUpInside)
+
+        configureIconButton(cancelButton, systemName: "xmark.circle")
+        cancelButton.accessibilityLabel = "取消"
+        cancelButton.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
+
+        let titleRow = UIStackView(arrangedSubviews: [nameLabel, shareButton, cancelButton])
+        titleRow.axis = .horizontal
+        titleRow.alignment = .center
+        titleRow.spacing = 6
+
+        let stack = UIStackView(arrangedSubviews: [titleRow, detailLabel, progressView])
+        stack.axis = .vertical
+        stack.spacing = 5
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 10),
+            stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -10)
+        ])
+
+        // Drag a finished received file out to Files or another app.
+        let drag = UIDragInteraction(delegate: self)
+        drag.isEnabled = true
+        contentView.addInteraction(drag)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    private func configureIconButton(_ button: UIButton, systemName: String) {
+        var config = UIButton.Configuration.plain()
+        config.image = UIImage(systemName: systemName)
+        config.baseForegroundColor = Palette.secondary
+        config.contentInsets = NSDirectionalEdgeInsets(top: 5, leading: 5, bottom: 5, trailing: 5)
+        config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+        button.configuration = config
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 30),
+            button.heightAnchor.constraint(equalToConstant: 30)
+        ])
+    }
+
+    func configure(with item: FileTransferItem) {
+        nameLabel.text = item.name
+        detailLabel.text = "\(item.direction.title) · \(item.statusText)"
+        progressView.progress = Float(item.progress)
+        progressView.isHidden = false
+        progressView.progressTintColor = {
+            switch item.status {
+            case .completed: return Palette.positive
+            case .failed: return Palette.negative
+            case .cancelled: return Palette.tertiary
+            case .waiting, .transferring: return Palette.warning
+            }
+        }()
+        detailLabel.textColor = item.status == .failed ? Palette.negative : Palette.secondary
+
+        cancelButton.isHidden = !item.status.isActive
+        let shareable = item.direction == .receive
+            && item.status == .completed
+            && item.localURL != nil
+        shareButton.isHidden = !shareable
+        dragURL = shareable ? item.localURL : nil
+        accessibilityLabel = "\(item.direction.title) \(item.name)，\(item.statusText)"
+    }
+
+    @objc private func cancelTapped() {
+        onCancel?()
+    }
+
+    @objc private func shareTapped() {
+        onShare?()
+    }
+
+    // MARK: UIDragInteractionDelegate
+
+    func dragInteraction(_ interaction: UIDragInteraction,
+                         itemsForBeginning session: UIDragSession) -> [UIDragItem] {
+        guard let url = dragURL,
+              let provider = NSItemProvider(contentsOf: url) else { return [] }
+        return [UIDragItem(itemProvider: provider)]
     }
 }
 

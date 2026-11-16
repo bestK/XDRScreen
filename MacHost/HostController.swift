@@ -132,6 +132,11 @@ protocol ClientSessionDelegate: AnyObject {
     /// decides which display to capture (mirror vs. dedicated virtual
     /// display) and only then calls `activate(target:)`.
     func clientSession(_ session: ClientSession, didAuthenticate name: String, request: CaptureRequest)
+    /// An authenticated client asked to change the target bitrate. `nil` means
+    /// the client handed control back to the host's quality tier.
+    func clientSession(_ session: ClientSession, didReceiveManualBitrateMbps mbps: Int?)
+    /// One authenticated file transfer packet (kinds 9–14) arrived.
+    func clientSession(_ session: ClientSession, didReceiveFileTransfer packet: WirePacket)
     func clientSessionDidEnd(_ session: ClientSession, reason: String)
 }
 
@@ -156,6 +161,11 @@ final class ClientSession {
     /// Quality tier requested by the host UI. Confined to `queue`; applied to
     /// the encoder before streaming and forwarded live after that.
     private var quality: HostQuality
+    /// Last explicit target in Mbps, from the host UI or an authenticated
+    /// client. `nil` follows the quality tier. Confined to `queue`; used at
+    /// activation and forwarded live afterwards. The client's message wins on
+    /// arrival (last writer wins), matching the host controller's state.
+    private var manualBitrateMbps: Int?
 
     private lazy var encoder = CaptureEncoder(isCongested: { [weak self] in
         self?.isCongested ?? false
@@ -194,6 +204,7 @@ final class ClientSession {
          hostName: String,
          helloSupportsHDR: Bool,
          quality: HostQuality,
+         manualBitrateMbps: Int?,
          idleTimeout: TimeInterval = 15,
          handshakeTimeout: TimeInterval = 10) {
         let queue = DispatchQueue(label: "com.xdrscreen.session", qos: .userInitiated)
@@ -203,6 +214,7 @@ final class ClientSession {
         self.hostName = hostName
         self.helloSupportsHDR = helloSupportsHDR
         self.quality = quality
+        self.manualBitrateMbps = manualBitrateMbps
         self.idleTimeout = idleTimeout
         self.handshakeTimeout = handshakeTimeout
     }
@@ -243,6 +255,19 @@ final class ClientSession {
             self.quality = quality
             guard self.activated else { return }
             self.encoder.setQuality(quality)
+        }
+    }
+
+    /// Thread-safe; used by the host controller for both its own UI choice and
+    /// a value reported by the authenticated client. `nil` means "follow the
+    /// quality tier". The value is remembered for the next `activate` even if
+    /// the session is not streaming yet.
+    func setManualBitrate(_ mbps: Int?) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.manualBitrateMbps = mbps
+            guard self.activated else { return }
+            self.encoder.setManualBitrate(mbps.map { $0 * 1_000_000 })
         }
     }
 
@@ -396,10 +421,47 @@ final class ClientSession {
                 delegate?.clientSession(self, didLog: "客户端：\(status.message)")
             }
 
+        case .clientSettings:
+            // Only an authenticated session may steer the encoder. Anything
+            // malformed or out of range is clamped or ignored, never fatal.
+            handleClientSettings(packet.payload)
+
+        case .fileOffer, .fileAccept, .fileReject, .fileChunk, .fileEnd, .fileCancel:
+            // File transfer is only legal on a session that proved the pairing
+            // key and completed the hello exchange.
+            guard isAuthenticated else { return }
+            delegate?.clientSession(self, didReceiveFileTransfer: packet)
+
         case .videoFormat, .videoFrame:
             // Server-to-client kinds; ignore.
             break
         }
+    }
+
+    /// Applies a `.clientSettings` payload. The client wins over the host's
+    /// current manual value (last writer wins): a non-nil value replaces it,
+    /// `nil` hands control back to the selected quality tier.
+    private func handleClientSettings(_ payload: Data) {
+        guard isAuthenticated else {
+            delegate?.clientSession(self, didLog: "未认证的连接发送了客户端设置，已忽略")
+            return
+        }
+        guard let message = try? JSONDecoder().decode(ClientSettingsMessage.self, from: payload) else {
+            delegate?.clientSession(self, didLog: "客户端码率设置无法解析，已忽略")
+            sendStatus("客户端发送了无法解析的码率设置，已忽略")
+            return
+        }
+        let clamped = message.clampedBitrateMbps
+        if let requested = message.bitrateMbps, requested != clamped {
+            delegate?.clientSession(self, didLog:
+                "客户端请求码率 \(requested) Mbps 超出 4–200 Mbps，已钳制为 \(clamped ?? ClientSettingsMessage.minBitrateMbps) Mbps")
+        }
+
+        manualBitrateMbps = clamped
+        if activated {
+            encoder.setManualBitrate(clamped.map { $0 * 1_000_000 })
+        }
+        delegate?.clientSession(self, didReceiveManualBitrateMbps: clamped)
     }
 
     private func handleHello(_ payload: Data) {
@@ -456,9 +518,12 @@ final class ClientSession {
         delegate?.clientSession(self, didUpdateClient: clientName)
         sendStatus("已建立加密会话", force: true)
         encoder.delegate = self
-        // Both calls land on the encoder queue in order, so the tier is in
-        // place before `startInternal` computes the first bitrate budget.
+        // Both calls land on the encoder queue in order, so the tier and any
+        // manual target are in place before `startInternal` computes the first
+        // bitrate budget. A manual value (host UI or a client that connected
+        // before the capture target was ready) keeps priority over the tier.
         encoder.setQuality(quality)
+        encoder.setManualBitrate(manualBitrateMbps.map { $0 * 1_000_000 })
         encoder.start(request.withTarget(target))
     }
 
@@ -638,6 +703,29 @@ final class ClientSession {
         endNow(reason: "视频帧发送失败：\(error.localizedDescription)")
     }
 
+    // MARK: File transfer channel
+
+    /// True only between a successful hello and teardown. The file service
+    /// uses this before every write, so a late callback cannot send on a
+    /// session that has already been replaced or closed.
+    var isFileTransferReady: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return authenticated && !ended
+    }
+
+    /// The controlled send entry for file transfer packets. Unlike the video
+    /// path it may be called from any thread (the service has its own queue);
+    /// `SecureChannel.send` serializes on the session queue, so ordering
+    /// between adjacent chunks is preserved.
+    func sendFilePacket(_ kind: MessageKind, payload: Data, completion: ((Error?) -> Void)?) {
+        guard isFileTransferReady else {
+            completion?(WireError.channelClosed)
+            return
+        }
+        channel.send(kind, payload: payload, completion: completion)
+    }
+
     // MARK: Errors
 
     private static func describe(_ error: NWError) -> String {
@@ -661,6 +749,10 @@ final class ClientSession {
         }
     }
 }
+
+// MARK: - ClientSession file transfer channel
+
+extension ClientSession: FileTransferSendChannel {}
 
 // MARK: - ClientSession capture delegate
 
@@ -768,12 +860,20 @@ final class HostController: NSObject, ObservableObject {
     /// User's persisted quality/bandwidth tier. Lives here so it applies to
     /// every new connection; the live session forwards changes to its encoder.
     @Published private(set) var quality: HostQuality
+    /// Currently effective manual target in Mbps; `nil` follows the tier.
+    /// Updated by the host UI and by an authenticated client's `.clientSettings`.
+    @Published private(set) var manualBitrateMbps: Int?
     /// Human-readable state of the dedicated display, nil when none exists.
     @Published private(set) var virtualDisplaySummary: String?
     @Published private(set) var virtualDisplayIsMain = false
     @Published private(set) var arrangementPromoted = false
 
     let deviceName: String
+
+    /// Bidirectional file transfer for the current session. Owned here so the
+    /// transfer list survives reconnects; the service is bound to exactly one
+    /// authenticated session at a time.
+    let fileTransfer = FileTransferService()
 
     /// Mirrors `displayMode` for the network queue, which must not read the
     /// main-thread published property directly.
@@ -784,6 +884,9 @@ final class HostController: NSObject, ObservableObject {
     /// must not read the main-thread published property directly.
     private var qualityForSessions: HostQuality
     private static let qualityDefaultsKey = "XDRScreen.host.quality"
+    /// Mirrors `manualBitrateMbps` for the network queue.
+    private var manualBitrateMbpsForSessions: Int?
+    private static let manualBitrateDefaultsKey = "XDRScreen.host.manualBitrateMbps"
 
     private let networkQueue = DispatchQueue(label: "com.xdrscreen.host.network", qos: .userInitiated)
     private var listener: NWListener?
@@ -826,8 +929,17 @@ final class HostController: NSObject, ObservableObject {
         let quality = storedQuality ?? .auto
         self.quality = quality
         qualityForSessions = quality
+        // A stored number is clamped again on read: a hand-edited or stale
+        // defaults value must never reach the encoder out of range.
+        let storedManual = (UserDefaults.standard.object(forKey: Self.manualBitrateDefaultsKey) as? Int)
+            .map(ClientSettingsMessage.clampMbps)
+        manualBitrateMbps = storedManual
+        manualBitrateMbpsForSessions = storedManual
         super.init()
         arrangement.onMessage = { [weak self] text in
+            self?.log(text)
+        }
+        fileTransfer.onLog = { [weak self] text in
             self?.log(text)
         }
     }
@@ -861,6 +973,7 @@ final class HostController: NSObject, ObservableObject {
             self.pendingSession = nil
             self.session?.close(reason: "主机已停止")
             self.session = nil
+            self.fileTransfer.unbind()
             self.publish {
                 self.isListening = false
                 self.serviceStatus = "已停止"
@@ -890,6 +1003,7 @@ final class HostController: NSObject, ObservableObject {
             self.session?.releaseInputNow()
             self.session?.close(reason: "应用退出")
             self.session = nil
+            self.fileTransfer.shutdownForTermination()
         }
     }
 
@@ -1104,7 +1218,8 @@ final class HostController: NSObject, ObservableObject {
             displayID: CGMainDisplayID(),
             hostName: deviceName,
             helloSupportsHDR: hdrCapable,
-            quality: qualityForSessions
+            quality: qualityForSessions,
+            manualBitrateMbps: manualBitrateMbpsForSessions
         )
         session.delegate = self
         return session
@@ -1152,6 +1267,7 @@ final class HostController: NSObject, ObservableObject {
             if self.session != nil {
                 self.session?.close(reason: "显示方式已切换，iPad 将自动重连")
                 self.session = nil
+                self.fileTransfer.unbind()
             }
             DispatchQueue.main.async {
                 self.releaseVirtualDisplayOnMain(reason: "切换显示方式")
@@ -1176,6 +1292,48 @@ final class HostController: NSObject, ObservableObject {
             self.qualityForSessions = quality
             self.session?.setQuality(quality)
             self.pendingSession?.setQuality(quality)
+        }
+    }
+
+    // MARK: Target bitrate
+
+    /// Persists and publishes an explicit target in Mbps; `nil` follows the
+    /// quality tier. Never drops the connection: the live and candidate
+    /// sessions forward the value to their encoder queues.
+    func setManualBitrate(_ mbps: Int?) {
+        applyManualBitrate(mbps.map(ClientSettingsMessage.clampMbps), source: .host)
+    }
+
+    private enum ManualBitrateSource {
+        case host
+        case client
+    }
+
+    /// Single path for the host UI and an authenticated client, so "last
+    /// writer wins" holds and the published UI value is always the effective
+    /// one. Persisted; the next session receives it before `start`.
+    private func applyManualBitrate(_ mbps: Int?, source: ManualBitrateSource) {
+        networkQueue.async {
+            guard mbps != self.manualBitrateMbpsForSessions else { return }
+            self.manualBitrateMbpsForSessions = mbps
+            if let mbps {
+                UserDefaults.standard.set(mbps, forKey: Self.manualBitrateDefaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.manualBitrateDefaultsKey)
+            }
+            self.publish { self.manualBitrateMbps = mbps }
+            switch (source, mbps) {
+            case (.client, .some(let value)):
+                self.log("客户端已将目标码率设为 \(value) Mbps")
+            case (.client, .none):
+                self.log("客户端已改为跟随主机的画质档位")
+            case (.host, .some(let value)):
+                self.log("目标码率已设为 \(value) Mbps（手动）")
+            case (.host, .none):
+                self.log("目标码率已改为跟随画质档位")
+            }
+            self.session?.setManualBitrate(mbps)
+            self.pendingSession?.setManualBitrate(mbps)
         }
     }
 
@@ -1550,6 +1708,9 @@ extension HostController: ClientSessionDelegate {
                 self.pendingSession = nil
                 let previous = self.session
                 self.session = session
+                // Rebinding cancels the old session's transfers; a transfer
+                // must never straddle two channels.
+                self.fileTransfer.bind(to: session)
 
                 if let previous, previous !== session {
                     self.log("新的 iPad 连接（\(name)）已验证，正在结束旧会话")
@@ -1572,7 +1733,25 @@ extension HostController: ClientSessionDelegate {
                 return
             }
             self.log("新的 iPad 连接（\(name)）已验证")
+            self.fileTransfer.bind(to: session)
             self.prepareAndActivate(session, request: request)
+        }
+    }
+
+    func clientSession(_ session: ClientSession, didReceiveFileTransfer packet: WirePacket) {
+        networkQueue.async {
+            // A candidate that has not taken over owns no file channel.
+            guard self.session === session else { return }
+            self.fileTransfer.handle(packet)
+        }
+    }
+
+    func clientSession(_ session: ClientSession, didReceiveManualBitrateMbps mbps: Int?) {
+        networkQueue.async {
+            // Only a live connection the controller knows about may change the
+            // persisted target; a torn-down or superseded session cannot.
+            guard self.session === session || self.pendingSession === session else { return }
+            self.applyManualBitrate(mbps, source: .client)
         }
     }
 
@@ -1627,6 +1806,8 @@ extension HostController: ClientSessionDelegate {
 
     func clientSessionDidEnd(_ session: ClientSession, reason: String) {
         networkQueue.async {
+            // Identity-checked: only the bound session cancels transfers.
+            self.fileTransfer.unbind(from: session)
             let wasCandidate = self.pendingSession === session
             if wasCandidate {
                 self.pendingSession = nil

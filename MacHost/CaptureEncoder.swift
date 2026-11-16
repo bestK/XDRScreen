@@ -437,6 +437,11 @@ final class CaptureEncoder: NSObject {
     /// Survives teardown: a tier chosen while idle is used when the next
     /// capture session creates its encoder.
     private var quality: HostQuality = .auto
+    /// Explicit user target in bits per second. `nil` follows the quality
+    /// tier's bits-per-pixel budget. Survives teardown like `quality`. When
+    /// set it wins over the tier, including across tier changes, until it is
+    /// cleared; `reduceBitrateIfNeeded` can still lower the live budget.
+    private var manualBitrate: Int?
     private var didReportNoDisplay = false
     private var didReportHDRUnavailable = false
     private var hdrFallbackScheduled = false
@@ -488,6 +493,51 @@ final class CaptureEncoder: NSObject {
         queue.async { self.setQualityInternal(quality) }
     }
 
+    /// Sets or clears an explicit target bitrate in bits per second.
+    /// Thread-safe: the work is serialised on the encoder queue.
+    ///
+    /// - `nil` clears the manual value; the current quality tier's
+    ///   bits-per-pixel budget is recomputed and applied.
+    /// - A non-nil value is clamped to 4–200 Mbps and becomes both the initial
+    ///   and current budget, applied immediately when an encoder exists.
+    ///
+    /// While a manual value is set it also wins over later tier changes. The
+    /// network backstop (`reduceBitrateIfNeeded`) still lowers the live budget
+    /// below it, with the same `max(4 Mbps, initial / 3)` floor as before.
+    func setManualBitrate(_ bitsPerSecond: Int?) {
+        queue.async { self.setManualBitrateInternal(bitsPerSecond) }
+    }
+
+    /// Manual target bounds, in bits per second (4–200 Mbps).
+    static let manualBitrateMinBps = 4_000_000
+    static let manualBitrateMaxBps = 200_000_000
+
+    private func setManualBitrateInternal(_ bitsPerSecond: Int?) {
+        let clamped = bitsPerSecond.map {
+            min(Self.manualBitrateMaxBps, max(Self.manualBitrateMinBps, $0))
+        }
+        if let bitsPerSecond, let clamped, bitsPerSecond != clamped {
+            delegate?.captureEncoder(self, didUpdateStatus:
+                "请求的码率 \(bitsPerSecond / 1_000_000) Mbps 超出 4–200 Mbps，已钳制为 \(clamped / 1_000_000) Mbps")
+        }
+        manualBitrate = clamped
+        guard let session = vtSession, targetWidth > 0, targetHeight > 0 else {
+            // No encoder yet: `startInternal` / `configure` will use the value
+            // when the next compression session is built.
+            return
+        }
+        initialBitrate = clamped ?? tierBitrate(width: targetWidth,
+                                                height: targetHeight,
+                                                fps: fps,
+                                                hdr: hdrMode.isHDR)
+        currentBitrate = initialBitrate
+        // A deliberate target change starts from a fresh budget, so the auto
+        // downgrade floor and its 10-second guard move with it.
+        lastBitrateCut = .distantPast
+        applyBitrate(session)
+        reportBitrateBudget()
+    }
+
     private func setQualityInternal(_ quality: HostQuality) {
         self.quality = quality
         guard let session = vtSession, targetWidth > 0, targetHeight > 0 else {
@@ -495,18 +545,36 @@ final class CaptureEncoder: NSObject {
             // builds the next compression session.
             return
         }
-        initialBitrate = Self.recommendedBitrate(width: targetWidth,
-                                                 height: targetHeight,
-                                                 fps: fps,
-                                                 hdr: hdrMode.isHDR,
-                                                 quality: quality)
+        // A manual target keeps winning over the tier. It stays in place so
+        // switching tiers never silently overrides the user's explicit number.
+        initialBitrate = manualBitrate ?? tierBitrate(width: targetWidth,
+                                                      height: targetHeight,
+                                                      fps: fps,
+                                                      hdr: hdrMode.isHDR)
         currentBitrate = initialBitrate
         // A deliberate tier change starts from a fresh budget: the auto
         // downgrade floor is derived from `initialBitrate`, so it moves too.
         lastBitrateCut = .distantPast
         applyBitrate(session)
+        reportBitrateBudget()
+    }
+
+    /// The budget implied by the current tier for the current format.
+    private func tierBitrate(width: Int, height: Int, fps: Int, hdr: Bool) -> Int {
+        Self.recommendedBitrate(width: width, height: height, fps: fps, hdr: hdr, quality: quality)
+    }
+
+    /// Publishes the currently effective target for the host UI log. Manual
+    /// values are labelled so the user can tell them apart from a tier budget.
+    private func reportBitrateBudget() {
         let mbps = String(format: "%.1f", Double(currentBitrate) / 1_000_000.0)
-        delegate?.captureEncoder(self, didUpdateStatus: "画质：\(quality.title) · \(mbps) Mbps")
+        if manualBitrate != nil {
+            delegate?.captureEncoder(self, didUpdateStatus:
+                "目标码率 \(mbps) Mbps（手动，优先于「\(quality.title)」档位）")
+        } else {
+            delegate?.captureEncoder(self, didUpdateStatus:
+                "画质：\(quality.title) · \(mbps) Mbps")
+        }
     }
 
     /// Marks a client keyframe request and lets the encoder queue answer it
@@ -955,7 +1023,13 @@ final class CaptureEncoder: NSObject {
         _ = Self.setProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: max(fps, 1) * 2))
         _ = Self.setProperty(session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 2.0))
 
-        initialBitrate = Self.recommendedBitrate(width: width, height: height, fps: fps, hdr: hdr, quality: quality)
+        // A manual target survives encoder restarts (display changes, HDR
+        // fallback) and wins over the tier until the user clears it.
+        initialBitrate = manualBitrate ?? Self.recommendedBitrate(width: width,
+                                                                  height: height,
+                                                                  fps: fps,
+                                                                  hdr: hdr,
+                                                                  quality: quality)
         currentBitrate = initialBitrate
         applyBitrate(session)
 
